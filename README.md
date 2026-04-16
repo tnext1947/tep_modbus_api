@@ -880,6 +880,7 @@ curl http://192.168.10.211:5000/health
 
 ## 📝 License
 
+Taweeporn Maneesin — Robotics software engineer
 Next Robotics Lab — Internal Use
 
 ---
