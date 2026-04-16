@@ -1,0 +1,98 @@
+{
+  "10007": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10002": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10001": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10008": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10004": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10016": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10009": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10014": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10003": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10010": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10012": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10015": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10011": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10013": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10006": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  },
+  "10005": {
+    "hold": false,
+    "alarm": false,
+    "taskID": null,
+    "robotID": null
+  }
+}
