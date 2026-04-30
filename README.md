@@ -1,7 +1,7 @@
 # 🏭 Station Monitor — API Protocol Guide
 
-> **Next Robotics Lab** · Industrial Modbus-TCP Station Management System  
-> Flask REST API · Python 3.10+ · 16 Stations · Real-time monitoring & control
+> **Next Robotics Lab** · Industrial Modbus-TCP Station Management System
+> Flask REST API · Python 3.8+ · Multi-Station · Real-time monitoring, control & simulation
 
 ---
 
@@ -9,56 +9,46 @@
 
 - [Overview](#-overview)
 - [Architecture](#-architecture)
+- [Files Reference](#-files-reference)
 - [Quick Start](#-quick-start)
 - [Authentication](#-authentication)
 - [Station Status Values](#-station-status-values)
+- [Coil / LED Mapping](#-coil--led-mapping)
 - [API Endpoints](#-api-endpoints)
-  - [Station — Report Status](#1-post-stationstatus)
-  - [Station — Get All Status](#2-get-stationstatusall)
-  - [Station — Get Single Status](#3-get-stationstatusid)
-  - [Station — Set Hold (Standby)](#4-post-stationstandby)
-  - [Station — Set Alarm](#5-post-stationalarm)
-  - [Heartbeat — Report](#6-post-heartbeat)
-  - [Heartbeat — Get All](#7-get-heartbeatall)
-  - [Heartbeat — Get Single](#8-get-heartbeatid)
-  - [Health Check](#9-get-health)
-  - [Scan — Manual Trigger](#10-post-scan)
-  - [Scan — Get Last Result](#11-get-scanresult)
-  - [Scan — Get Scan Status](#12-get-scanstatus)
-  - [Device IP — Get Version](#13-get-device_ipversion)
-  - [Device IP — Get Map](#14-get-device_ip)
-- [IP Discovery — Auto Scan Features](#-ip-discovery--auto-scan-features)
+  - [Station Status](#station-status)
+  - [Hold (Standby)](#hold-standby)
+  - [Alarm](#alarm)
+  - [Heartbeat](#heartbeat)
+  - [Health Check](#health-check)
+  - [Simulation Mode](#simulation-mode)
+  - [IP Scan](#ip-scan)
+  - [Device IP](#device-ip)
+- [Hold + FULL Wait Flow](#-hold--full-wait-flow)
+- [Simulation Mode Guide](#-simulation-mode-guide)
+- [IP Discovery](#-ip-discovery)
+- [Auto-Scan Features](#-auto-scan-features)
+- [Log Files](#-log-files)
 - [Error Codes](#-error-codes)
 - [Configuration Reference](#-configuration-reference)
-- [File Reference](#-file-reference)
-- [Coil / LED Mapping](#-coil--led-mapping)
 - [Data Flow Diagram](#-data-flow-diagram)
 
 ---
 
 ## 🔍 Overview
 
-The Station Monitor API manages up to **16 industrial stations** on a factory floor. Each station communicates via **Modbus-TCP** through `cilent.py`, which polls sensor data and reports it to `server.py` every second.
-
-```
-Station Device (Modbus-TCP)
-        │  192.168.20.x:8899
-        ▼
-  cilent.py  ──POST /station/status──▶  server.py :5000
-                                               │
-  Dashboard / Robot  ◀──GET /station/status/all, /health──┘
-```
+The Station Monitor manages industrial stations on a factory floor. Each station communicates via **Modbus-TCP** through `client.py`, which polls sensor data every second and reports it to `server_sim.py`. The server manages state, hold/alarm logic, and simulation.
 
 **Key features:**
-
 - ✅ Real-time station status at 1-second poll rate
-- ✅ Hold / Release operation mode per station (robot task coordination)
+- ✅ Hold / Release with robot task coordination
 - ✅ Hold allowed on FULL stations — robot waits until station clears automatically
-- ✅ Alarm (buzzer) control per station
-- ✅ Automatic IP discovery with nmap + ARP scan
-- ✅ State persistence across server restarts
-- ✅ Heartbeat monitoring per device
-- ✅ Rate limiting (5 req/s per device)
+- ✅ Per-device **Simulation Mode** — test without physical hardware
+- ✅ Automatic IP discovery via nmap + ARP
+- ✅ Fixed 10-second reconnect retry (no exponential backoff ceiling)
+- ✅ State persistence across server restarts (`state.json`, `state_sim.json`)
+- ✅ `connect.log` — first connect, reconnect, disconnect per device
+- ✅ `operation.log` — hold start/end/restore events
+- ✅ 7-day log retention with automatic cleanup
 
 ---
 
@@ -66,9 +56,36 @@ Station Device (Modbus-TCP)
 
 | Component | File | Role |
 |---|---|---|
-| **API Server** | `server.py` | Central state manager. Receives sensor data, handles hold/alarm commands, serves dashboard queries |
-| **Modbus Client** | `cilent.py` | Runs on gateway machine. Polls each station via Modbus-TCP, POSTs to server every 1s |
-| **IP Discovery** | `ip.py` | One-shot CLI tool. Scans subnet via nmap+ARP, writes `device_ip.json` |
+| **API Server** | `server_sim.py` | Central state manager. Receives sensor data, handles hold/alarm/sim, serves dashboard |
+| **Modbus Client** | `client.py` | Polls each station via Modbus-TCP every 1s, POSTs to server |
+| **IP Discovery** | `ip.py` | CLI tool: scans subnet via nmap+ARP, writes `device_ip.json` |
+
+---
+
+## 📁 Files Reference
+
+| File | Purpose |
+|---|---|
+| `devices.json` | **Input** — maps device ID → MAC address |
+| `device_ip.json` | **Auto-managed** — maps device ID → IP (written by `ip.py` or `/scan`) |
+| `state.json` | **Auto-managed** — persists hold/alarm state across server restarts |
+| `state_sim.json` | **Auto-managed** — persists simulation state across server restarts |
+| `operation.log` | Hold start/end/restore events (10 MB × 10 files, 7-day retention) |
+| `connect.log` | CONNECT_FIRST / CONNECT_LAST / DISCONNECT events (5 MB × 14 files, 7-day retention) |
+| `client.log` | Modbus reads, reconnect events (5 MB × 5 files, 7-day retention) |
+
+### `devices.json` format
+
+```json
+{
+  "10001": "D4-AD-20-CA-69-81",
+  "20001": "D4-AD-20-CA-63-05",
+  "30021": "D4-AD-20-E1-53-89",
+  "30031": ""
+}
+```
+
+> Devices with empty MAC (`""`) are known IDs with no physical hardware yet — can be used in simulation mode.
 
 ---
 
@@ -78,85 +95,76 @@ Station Device (Modbus-TCP)
 
 ```bash
 pip install flask pyModbusTCP requests
-sudo apt install nmap        # Linux only
+sudo apt install nmap
 ```
 
-### 2. Prepare `devices.json`
-
-```json
-{
-  "10001": "D4-AD-20-CA-69-81",
-  "10002": "D4-AD-20-CA-69-5D"
-}
-```
-
-### 3. Run IP discovery (first time or after network changes)
+### 2. Run IP discovery
 
 ```bash
-# Auto-detect gateway and scan
-sudo python ip.py
-
-# Or specify subnet manually
-sudo python ip.py --gateway 192.168.20.0/24
+sudo python3 ip.py --gateway 192.168.20.0/24
 ```
 
-### 4. Start the server
+### 3. Start the server
 
 ```bash
-python server.py
-# Server starts on http://0.0.0.0:5000
-# Auto-scan runs on startup, every 10 min, and on disconnect events
+python3 server_sim.py
 ```
 
-### 5. Start the Modbus client
+### 4. Start the Modbus client
 
 ```bash
-python cilent.py
-# Reads device_ip.json, connects to all stations, begins polling
+python3 client.py
 ```
 
 ---
 
 ## 🔑 Authentication
 
-All endpoints **except** `/health` require the API key in the request header.
-
-| Header | Value |
-|---|---|
-| `X-API-Key` | `nextroboticslab2024` |
-
-**Example:**
+All endpoints **except** `GET /health` require:
 
 ```http
-GET /station/status/all HTTP/1.1
-Host: 192.168.10.211:5000
 X-API-Key: nextroboticslab2024
 ```
 
-```python
-# Python requests
-headers = {
-    "X-API-Key": "nextroboticslab2024",
-    "Content-Type": "application/json"
-}
+```javascript
+// Node-RED / JavaScript
+msg.headers = { 'X-API-Key': 'nextroboticslab2024' };
 ```
-
-> ⚠️ The API key can be overridden via the `API_KEY` environment variable.
 
 ---
 
 ## 🚦 Station Status Values
 
-The server **derives** the status — clients only send the raw sensor input (`0` or `1`).
+The server **derives** status — clients only send raw `input` (0 or 1).
 
-| Status | LED Coil | Condition |
+| Status | Condition |
+|---|---|
+| `NORMAL` | No hold, no alarm, sensor = 0 |
+| `FULL` | Sensor = 1 (station occupied), or hold=true with sensor=1 |
+| `BUSY` | `hold=true` AND sensor = 0 — robot reserved, station is clear |
+| `ALARM` | `alarm=true`, no hold, sensor = 0 |
+| `OFFLINE` | No heartbeat received within `STALE_THRESHOLD` seconds (default 5s) |
+
+> **Sim mode:** When `sim_active=true`, the virtual `sim_input` replaces the real sensor for status derivation. The `input` field in GET responses also reflects the virtual value while sim is active.
+
+---
+
+## 💡 Coil / LED Mapping
+
+`client.py` writes Modbus coils based on the status returned by the server:
+
+| Coil | Color | Active When |
 |---|---|---|
-| `BUSY` | Coil 1 — 🟡 Yellow | `hold=true` **AND** `sensor=0` — robot has reserved the station and it is now clear |
-| `FULL` | Coil 2 — 🔴 Red | `sensor=1` — station is physically occupied (with or without a hold) |
-| `ALARM` | Coil 3 — 🔔 Buzzer | `alarm=true`, no active hold, sensor clear |
-| `NORMAL` | Coil 0 — 🟢 Green | No hold, no alarm, sensor clear |
+| Coil 0 | 🟢 Green | `status = NORMAL` |
+| Coil 1 | 🟡 Yellow | `status = BUSY` |
+| Coil 2 | 🔴 Red | `status = FULL` |
+| Coil 3 | 🔔 Buzzer/Alarm | `status = ALARM` |
 
-> **Hold + FULL behaviour:** Setting `hold=true` on a FULL station is **allowed and returns HTTP 200**. The status stays `FULL` while the sensor is HIGH — the server does not promote it to `BUSY` yet. The robot polls `GET /station/status/<id>` and waits. The moment the physical sensor drops to `0`, the server **automatically** changes the status to `BUSY` on the next `/station/status` POST from `cilent.py`. The robot sees `BUSY` and knows it can approach. `taskID` and `robotID` are preserved throughout the wait.
+Only one coil is active at a time.
+
+> When a robot holds a FULL station while waiting, the LED stays 🔴 Red until the item is removed, then switches automatically to 🟡 Yellow (BUSY).
+
+> In simulation mode, coil writes still happen based on the simulated status. To skip physical coil writes during simulation, uncomment the `is_sim: continue` block in `client.py`.
 
 ---
 
@@ -166,348 +174,203 @@ Base URL: `http://<server-ip>:5000`
 
 ---
 
-### 1. `POST /station/status`
+### Station Status
 
-**Called by `cilent.py` every 1 second.** Reports raw physical sensor reading. Server derives and returns computed status.
+#### `POST /station/status`
+Called by `client.py` every 1 second. Sends raw physical sensor reading.
 
-**Auth required:** ✅ Yes  
-**Rate limit:** 5 requests/second per device
+**Auth:** ✅ Required · **Rate limit:** 5 req/s per device
 
-#### Request Body
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `id` | `integer` | ✅ | Device ID (e.g. `10001`) — must be integer, not string |
-| `input` | `0` or `1` | ✅ | Physical sensor reading. `1` = station occupied/full |
-| `timestamp` | `string` | ❌ | `"YYYY-MM-DD HH:MM:SS"` — used for disconnect detection |
-
+**Request:**
 ```json
-{
-  "id": 10001,
-  "input": 0,
-  "timestamp": "2026-04-03 15:30:00"
-}
+{ "id": 10001, "input": 0, "timestamp": "2026-04-27 09:00:00" }
 ```
-
-#### Response — `HTTP 201`
 
 | Field | Type | Description |
 |---|---|---|
-| `message` | `string` | `"OK"` |
-| `status` | `string` | Server-derived status: `NORMAL` / `FULL` / `BUSY` / `ALARM` |
-| `hold_mode` | `boolean` | `true` if station is currently held |
-| `alarm_mode` | `boolean` | `true` if alarm is active |
-| `taskID` | `string\|null` | Current task ID if hold active |
-| `robotID` | `string\|null` | Current robot ID if hold active |
+| `id` | `integer` | Device ID |
+| `input` | `0` or `1` | Physical sensor value only — server computes status |
+| `timestamp` | `string` | `"YYYY-MM-DD HH:MM:SS"` |
 
+**Response `201`:**
 ```json
 {
-  "message": "OK",
-  "status": "NORMAL",
-  "hold_mode": false,
+  "message":    "OK",
+  "status":     "NORMAL",
+  "hold_mode":  false,
   "alarm_mode": false,
-  "taskID": null,
-  "robotID": null
+  "taskID":     null,
+  "robotID":    null,
+  "simulated":  false
 }
 ```
 
+> `simulated: true` tells `client.py` that sim mode is active for this device. Used to optionally skip physical coil writes.
+
 ---
 
-### 2. `GET /station/status/all`
+#### `GET /station/status/all`
+Returns state snapshot of all registered devices.
 
-Returns the full current state snapshot for **all registered devices**.
+**Auth:** ✅ Required
 
-**Auth required:** ✅ Yes
-
-#### Response — `HTTP 200`
-
+**Response `200`:**
 ```json
 {
   "10001": {
-    "hold": false,
-    "alarm": false,
+    "hold": false, "alarm": false,
     "status": "NORMAL",
     "input": 0,
-    "timestamp": "2026-04-03 15:30:01",
-    "taskID": null,
-    "robotID": null
+    "timestamp": "2026-04-27 09:00:01",
+    "taskID": null, "robotID": null,
+    "sim_active": false, "sim_input": 0
   },
-  "10003": {
-    "hold": true,
-    "alarm": false,
+  "10008": {
+    "hold": true, "alarm": false,
     "status": "BUSY",
     "input": 0,
-    "timestamp": "2026-04-03 15:30:01",
-    "taskID": "TASK-042",
-    "robotID": "SMR-01"
+    "taskID": "TASK-042", "robotID": "SMR-01",
+    "sim_active": true, "sim_input": 0
   }
 }
 ```
 
-> Keys are device IDs as **integers**. Devices not yet registered (no POST received) will not appear.
+> When `sim_active=true`, the `input` field reflects `sim_input` (virtual sensor), not the real physical sensor.
 
 ---
 
-### 3. `GET /station/status/<id>`
+#### `GET /station/status/<id>`
+Returns state for a single device. Same structure as one entry from `/station/status/all`.
 
-Returns state for a **single device**.
-
-**Auth required:** ✅ Yes
-
-```http
-GET /station/status/10001
-X-API-Key: nextroboticslab2024
-```
-
-#### Response — `HTTP 200`
-
-Same structure as a single entry from `/station/status/all`.
-
-Returns `HTTP 404` + `ret_code 4020` if device is not registered.
+Returns `HTTP 404` + `ret_code 4020` if device not registered.
 
 ---
 
-### 4. `POST /station/standby`
+### Hold (Standby)
 
-**Set or release operation hold on a station.**
+#### `POST /station/standby`
 
-A robot calls this to reserve a station. The hold stores `taskID` and `robotID` for the duration of the operation. Only the same robot that set the hold can release it.
+Reserve or release a station for robot operation.
 
-**Auth required:** ✅ Yes
+**Auth:** ✅ Required
 
-#### Request Body — Set Hold
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `id` | `integer` | ✅ | Device ID |
-| `hold` | `boolean` | ✅ | `true` = activate hold, `false` = release |
-| `robotID` | `string` | ✅ | Robot identifier. **Must match exactly when releasing** |
-| `taskID` | `string` | ✅ when `hold=true` | Task identifier |
-
+**Request — Set Hold:**
 ```json
 {
-  "id": 10005,
-  "hold": true,
+  "id":      10005,
+  "hold":    true,
   "robotID": "SMR-01",
-  "taskID": "TASK-042"
+  "taskID":  "TASK-042"
 }
 ```
 
-#### Request Body — Release Hold
-
+**Request — Release Hold:**
 ```json
-{
-  "id": 10005,
-  "hold": false,
-  "robotID": "SMR-01"
-}
+{ "id": 10005, "hold": false, "robotID": "SMR-01" }
 ```
 
-#### Response — `HTTP 200`
-
-| Field | Type | Description |
-|---|---|---|
-| `message` | `string` | Confirmation message |
-| `hold` | `boolean` | Current hold state |
-| `status` | `string` | `"BUSY"` if sensor=0, `"FULL"` if sensor=1 |
-| `taskID` | `string\|null` | Active task ID |
-| `robotID` | `string\|null` | Active robot ID |
-
-**Station is clear (sensor=0) — robot can proceed immediately:**
+**Response `200` — station was clear (sensor=0):**
 ```json
 {
   "message": "Device 10005 hold=True",
-  "hold": true,
-  "status": "BUSY",
-  "taskID": "TASK-042",
+  "hold":    true,
+  "status":  "BUSY",
+  "taskID":  "TASK-042",
   "robotID": "SMR-01"
 }
 ```
 
-**Station is occupied (sensor=1) — robot must wait:**
+**Response `200` — station is occupied (sensor=1):**
 ```json
 {
   "message": "Device 10005 hold=True",
-  "hold": true,
-  "status": "FULL",
-  "taskID": "TASK-042",
+  "hold":    true,
+  "status":  "FULL",
+  "taskID":  "TASK-042",
   "robotID": "SMR-01"
 }
 ```
 
-> Hold is successfully registered in both cases. When `status` is `"FULL"`, the robot polls `GET /station/status/<id>` and waits until `status` changes to `"BUSY"`.
+> When `status=FULL`, hold is registered and reserved. The robot polls `GET /station/status/<id>` until status becomes `BUSY`.
 
----
+**Hold Business Rules:**
 
-#### 🔄 Hold + FULL Wait Flow
-
-```
-Robot sends POST /station/standby { hold: true, robotID: "SMR-01", taskID: "TASK-042" }
-                    │
-           sensor = 1 (FULL — item still present)
-                    │
-                    ▼
-       Response 200: { "status": "FULL", "hold": true,
-                       "taskID": "TASK-042", "robotID": "SMR-01" }
-                    │
-                    ▼
-       Robot polls GET /station/status/10005 every 1 second
-                    │
-       sensor=1 → status: "FULL" → keep waiting...
-       sensor=1 → status: "FULL" → keep waiting...
-                    │
-       Item is removed from station
-                    │
-       sensor drops to 0  ← detected automatically by cilent.py
-                    │
-                    ▼
-       Next poll: { "status": "BUSY", "hold": true,
-                    "taskID": "TASK-042", "robotID": "SMR-01" }
-                    │
-                    ▼
-       Robot sees BUSY → approaches station ✅
-                    │
-                    ▼
-       Robot finishes → POST /station/standby { hold: false, robotID: "SMR-01" }
-                    │
-                    ▼
-       Response: { "status": "NORMAL", "hold": false }
-```
-
----
-
-#### Hold Business Rules
-
-| Condition | HTTP | ret\_code | Behaviour |
+| Condition | HTTP | ret_code | Behaviour |
 |---|---|---|---|
-| Station is **FULL** when hold is set | `200` | — | ✅ **Allowed.** Hold is registered. `status` returns `"FULL"`. Robot polls until `"BUSY"` |
-| Station is **NORMAL** when hold is set | `200` | — | ✅ **Allowed.** `status` returns `"BUSY"` immediately |
-| Station already held by **another** robot | `409` | `4030` | ❌ Rejected. Response includes `held_by: {robotID, taskID}` |
-| Wrong robot tries to release | `403` | `4030` | ❌ Only the holding robot can release |
-| Device not registered | `404` | `4020` | ❌ Device must POST `/station/status` at least once |
+| Station FULL when hold is set | `200` | — | ✅ Allowed — hold registered, status=FULL, robot waits |
+| Station NORMAL when hold is set | `200` | — | ✅ Allowed — status=BUSY immediately |
+| Already held by another robot | `409` | `4030` | ❌ Rejected |
+| Wrong robot tries to release | `403` | `4030` | ❌ Only holding robot can release |
+| Device OFFLINE | `409` | `4022` | ❌ Rejected — device unreachable |
+| Device not registered | `404` | `4020` | ❌ Device must POST `/station/status` first |
 
 ---
 
-### 5. `POST /station/alarm`
+### Alarm
 
-**Activates or deactivates the buzzer/alarm for a station.**
+#### `POST /station/alarm`
 
-**Auth required:** ✅ Yes
-
-#### Request Body
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `id` | `integer` | ✅ | Device ID |
-| `alarm` | `boolean` | ✅ | `true` = alarm ON, `false` = alarm OFF |
+**Auth:** ✅ Required
 
 ```json
 { "id": 10005, "alarm": true }
 ```
 
-#### Response — `HTTP 200`
+**Response `200`:** `{ "message": "Device 10005 alarm=True" }`
 
-```json
-{ "message": "Device 10005 alarm=True" }
-```
-
-> When `alarm=true` and no hold is active, station status becomes `ALARM`.  
-> If hold is active, alarm is stored but status follows hold logic (`BUSY` or `FULL`).
+Returns `409` + `ret_code 4022` if device is OFFLINE.
 
 ---
 
-### 6. `POST /heartbeat`
+### Heartbeat
 
-**Called by `cilent.py` every 1 second** to report per-device health metrics.
-
-**Auth required:** ✅ Yes
-
-#### Request Body
-
-| Field | Type | Description |
-|---|---|---|
-| `id` | `integer` | Device ID |
-| `start_time` | `string` | ISO datetime when client thread started |
-| `last_seen` | `string\|null` | Last successful Modbus read timestamp |
-| `timeout_count` | `integer` | Total Modbus read timeouts |
-| `post_ok` | `integer` | Successful API POSTs |
-| `post_fail` | `integer` | Failed API POSTs |
-| `reconnects` | `integer` | Modbus reconnect attempts |
+#### `POST /heartbeat`
+Called by `client.py` every 1 second per device.
 
 ```json
 {
   "id": 10001,
-  "start_time": "2026-04-03T09:00:00",
-  "last_seen": "2026-04-03 15:30:01",
-  "timeout_count": 2,
-  "post_ok": 4520,
-  "post_fail": 3,
-  "reconnects": 1
+  "start_time":    "2026-04-27T08:00:00",
+  "last_seen":     "2026-04-27 09:00:01",
+  "timeout_count": 0,
+  "post_ok":       3600,
+  "post_fail":     0,
+  "reconnects":    0
 }
 ```
 
-#### Response — `HTTP 200`
+#### `GET /heartbeat/all`
+Latest heartbeat for every device.
 
-```json
-{ "message": "OK" }
-```
+#### `GET /heartbeat/<id>`
+Latest heartbeat for one device. Returns `HTTP 404` + `ret_code 4021` if never received.
 
----
-
-### 7. `GET /heartbeat/all`
-
-Returns the latest heartbeat snapshot for **every device**.
-
-**Auth required:** ✅ Yes
-
-#### Response — `HTTP 200`
-
+**Example response:**
 ```json
 {
-  "10001": {
-    "id": 10001,
-    "start_time": "2026-04-03T09:00:00",
-    "last_seen": "2026-04-03 15:30:01",
-    "timeout_count": 0,
-    "post_ok": 4520,
-    "post_fail": 0,
-    "reconnects": 0
-  }
+  "id": 10001,
+  "start_time":    "2026-04-27T08:00:00",
+  "last_seen":     "2026-04-27 09:00:01",
+  "timeout_count": 0,
+  "post_ok":       3600,
+  "post_fail":     0,
+  "reconnects":    1
 }
 ```
 
 ---
 
-### 8. `GET /heartbeat/<id>`
+### Health Check
 
-Returns heartbeat for a **single device**.
-
-**Auth required:** ✅ Yes
-
-Returns `HTTP 404` + `ret_code 4021` if no heartbeat received yet for that device.
-
----
-
-### 9. `GET /health`
-
-System-wide health snapshot. **No authentication required.**
-
-#### Response — `HTTP 200`
-
-| Field | Type | Description |
-|---|---|---|
-| `server_time` | `string` | Current server datetime |
-| `total_devices` | `integer` | Number of registered devices |
-| `disconnected_device` | `array[int]` | IDs whose last timestamp is older than `STALE_THRESHOLD` |
-| `buzzer_on` | `array[int]` | IDs with `alarm=true` |
-| `hold_devices` | `array[object]` | Devices with active hold: `{id, taskID, robotID}` |
+#### `GET /health`
+**No authentication required.**
 
 ```json
 {
-  "server_time": "2026-04-03 15:30:05",
-  "total_devices": 16,
+  "server_time":         "2026-04-27 09:00:05",
+  "total_devices":       16,
   "disconnected_device": [],
-  "buzzer_on": [],
+  "buzzer_on":           [],
   "hold_devices": [
     { "id": 10005, "taskID": "TASK-042", "robotID": "SMR-01" }
   ]
@@ -516,205 +379,349 @@ System-wide health snapshot. **No authentication required.**
 
 ---
 
-### 10. `POST /scan`
+### Simulation Mode
 
-**Manually trigger** an nmap + ARP sweep to rediscover device IPs.
+Per-device simulation — test hold/alarm/status flow without physical hardware. When a device is in sim mode:
+- Real Modbus sensor value is ignored
+- Virtual `sim_input` (0 or 1) is used instead for all status calculations
+- The `input` field in GET responses reflects `sim_input`
+- Device is never considered OFFLINE (bypasses heartbeat check)
+- Devices are auto-registered in `devices_db` if they don't exist yet
 
-**Auth required:** ✅ Yes
+---
 
-> ⚠️ Server must run with `sudo` on Linux. Returns `HTTP 409` if a scan is already running.
+#### `POST /simulation/mode`
+Enable or disable simulation for one device.
 
-#### Request Body (all optional)
-
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `subnet` | `string` | `192.168.20.0/24` | CIDR subnet to scan |
-| `timeout` | `integer` | `60` | nmap per-host timeout in seconds |
-
-#### Response — `HTTP 200`
+**Auth:** ✅ Required
 
 ```json
-{
-  "subnet": "192.168.20.0/24",
-  "total": 16,
-  "found": 16,
-  "missing": [],
-  "matched": {
-    "10001": "192.168.20.37",
-    "10002": "192.168.20.48"
-  },
-  "scanned_at": "2026-04-03 15:31:19"
-}
+{ "id": 30022, "active": true }
+```
+
+**Response `200`:**
+```json
+{ "id": 30022, "sim_active": true, "sim_input": 0, "status": "NORMAL" }
+```
+
+> Devices not in `devices.json` or never connected can still be simulated — they are auto-registered on first `POST /simulation/mode`.
+
+---
+
+#### `POST /simulation/input`
+Set the virtual sensor value (0 = empty, 1 = full).
+
+**Auth:** ✅ Required
+
+```json
+{ "id": 30022, "input": 1 }
+```
+
+**Response `200`:**
+```json
+{ "id": 30022, "sim_input": 1 }
+```
+
+> The status changes immediately on the server without waiting for the next `client.py` POST cycle.
+
+---
+
+**Complete simulation flow example:**
+
+```bash
+# 1. Enable sim for device 30022
+POST /simulation/mode   { "id": 30022, "active": true }
+
+# 2. Set sensor to FULL
+POST /simulation/input  { "id": 30022, "input": 1 }
+# → GET /station/status/30022 shows: { "status": "FULL", "input": 1, "sim_active": true }
+
+# 3. Robot holds the station
+POST /station/standby   { "id": 30022, "hold": true, "robotID": "SMR-01", "taskID": "T-001" }
+# → { "status": "FULL", "hold": true }  ← robot waits
+
+# 4. Simulate item removed
+POST /simulation/input  { "id": 30022, "input": 0 }
+# → { "status": "BUSY", "hold": true }  ← robot proceeds
+
+# 5. Robot done
+POST /station/standby   { "id": 30022, "hold": false, "robotID": "SMR-01" }
+# → { "status": "NORMAL", "hold": false }
+
+# 6. Disable sim
+POST /simulation/mode   { "id": 30022, "active": false }
+# → Real physical sensor resumes
 ```
 
 ---
 
-### 11. `GET /scan/result`
+### IP Scan
 
-Returns the **most recent scan result** without running a new scan.
+#### `POST /scan`
+Trigger nmap + ARP sweep to rediscover device IPs.
 
-**Auth required:** ✅ Yes
+**Auth:** ✅ Required · Returns `409` if scan already running.
 
-Returns `HTTP 404` + `ret_code 4041` if no scan has been run since server start.
+```json
+{ "subnet": "192.168.20.0/24", "timeout": 60 }
+```
 
----
+**Response `200`:**
+```json
+{
+  "subnet":     "192.168.20.0/24",
+  "total":      16,
+  "found":      15,
+  "missing":    [10007],
+  "matched":    { "10001": "192.168.20.37", "10002": "192.168.20.48" },
+  "scanned_at": "2026-04-27 09:01:00"
+}
+```
 
-### 12. `GET /scan/status`
+#### `GET /scan/result`
+Last scan result. Returns `404` if no scan has run yet.
 
-Check whether a scan is **currently running**.
-
-**Auth required:** ✅ Yes
-
+#### `GET /scan/status`
 ```json
 { "running": false }
 ```
 
 ---
 
-### 13. `GET /device_ip/version`
+### Device IP
 
-Returns the **current version number** of `device_ip.json`. Clients poll this — when the version changes they call `/device_ip` to reload IPs.
-
-**Auth required:** ✅ Yes
+#### `GET /device_ip/version`
+Version number of `device_ip.json`. Clients poll this — when version changes they reload IPs.
 
 ```json
 { "version": 3 }
 ```
 
----
-
-### 14. `GET /device_ip`
-
-Returns the **full contents of `device_ip.json`** along with the current version.
-
-**Auth required:** ✅ Yes
+#### `GET /device_ip`
+Current `device_ip.json` contents + version.
 
 ```json
 {
   "version": 3,
-  "device_ip": {
-    "10001": "192.168.20.37",
-    "10002": "192.168.20.48",
-    "10003": "192.168.20.36"
-  }
+  "device_ip": { "10001": "192.168.20.37", "10002": "192.168.20.48" }
 }
 ```
 
 ---
 
-## 🌐 IP Discovery — Auto Scan Features
-
-| Mode | When | Trigger | Env Variable |
-|---|---|---|---|
-| **Startup Scan** | Server boot | Background thread at startup | — |
-| **Periodic Scan** | Every 10 minutes | Background timer loop | `PERIODIC_SCAN_INTERVAL` (default: `600`s) |
-| **Disconnect-Triggered Scan** | Device goes offline | New stale devices detected → rescan after delay | `DISCONNECT_SCAN_DELAY` (default: `30`s) |
-| **Manual Scan** | On demand | `POST /scan` | `DEFAULT_SUBNET`, `NMAP_TIMEOUT` |
-
-### How Disconnect-Triggered Scan Works
+## 🔄 Hold + FULL Wait Flow
 
 ```
-Device goes offline (no POST for > STALE_THRESHOLD seconds)
-        │
-        ▼
-Disconnect monitor detects newly stale device(s)
-        │
-        ▼
-Schedule rescan in DISCONNECT_SCAN_DELAY seconds (default 30s)
-(multiple disconnects are debounced into one scan)
-        │
-        ▼
-nmap + ARP sweep → update device_ip.json → bump version
-        │
-        ▼
-Clients polling GET /device_ip/version detect the change
-        │
-        ▼
-Clients call GET /device_ip → reload IP map → reconnect
+Robot → POST /station/standby { hold: true, robotID: "SMR-01", taskID: "TASK-042" }
+                   │
+          sensor = 1 (FULL — item present)
+                   │
+                   ▼
+     Response 200: { "status": "FULL", "hold": true,
+                     "taskID": "TASK-042", "robotID": "SMR-01" }
+                   │
+                   ▼
+     Robot polls GET /station/status/10005 every 1s
+                   │
+          sensor=1 → status: "FULL" → keep waiting ...
+                   │
+          Item removed from station
+                   │
+          sensor drops to 0 ← detected by client.py
+                   │
+                   ▼
+     Next poll: { "status": "BUSY", "hold": true,
+                  "taskID": "TASK-042", "robotID": "SMR-01" }
+                   │
+                   ▼
+     Robot sees BUSY → approaches station ✅
+                   │
+                   ▼
+     Robot done → POST /station/standby { hold: false, robotID: "SMR-01" }
+                   │
+                   ▼
+     { "status": "NORMAL", "hold": false }
 ```
 
-### Manual IP Discovery with `ip.py`
+---
+
+## Simulation Mode Guide
+
+### When to use
+
+- Testing robot integration without physical PLCs
+- Verifying hold/alarm/wait logic end-to-end
+- Testing new device IDs (`30031`, `30032`, etc.) not yet wired
+- Demo and training
+
+### Dashboard controls
+
+| Button | Action |
+|---|---|
+| **SIM** | Toggle simulation ON/OFF for this device |
+| **SENS:0 / SENS:1** | Toggle virtual sensor (enabled only when SIM is ON) |
+
+When SIM is ON:
+- Row background turns light blue
+- `Input` column shows virtual value with `[S]` indicator
+- Status changes immediately when SENS is toggled
+- HOLD and ALARM buttons are enabled even when device is OFFLINE
+
+### Persistence
+
+`state_sim.json` saves all simulation states. After server restart, sim devices that were active are automatically restored.
+
+### Coil write behavior
+
+By default, `client.py` still writes physical coils based on simulated status. To prevent this during simulation, uncomment in `client.py`:
+
+```python
+## SIM — uncomment to skip coil writes during simulation
+# if is_sim:
+#     continue
+```
+
+---
+
+## 🌐 IP Discovery
+
+### Automatic (server-side)
+
+The server runs scans automatically:
+
+| Trigger | When |
+|---|---|
+| **Startup** | Once at server start (background, non-blocking) |
+| **Periodic** | Every 10 minutes |
+| **Disconnect** | When a device goes OFFLINE — rescans after 30s debounce |
+
+### Manual — `ip.py`
 
 ```bash
-sudo python ip.py                                          # auto-detect subnet
-sudo python ip.py --gateway 192.168.20.0/24               # specify manually
-sudo python ip.py --gateway 192.168.20.0/24 --timeout 30  # custom timeout
+# Auto-detect subnet
+sudo python3 ip.py
+
+# Specify subnet
+sudo python3 ip.py --gateway 192.168.20.0/24
+
+# Custom timeout
+sudo python3 ip.py --gateway 192.168.20.0/24 --timeout 30
 ```
+
+`ip.py` reads `devices.json`, runs `nmap -sn`, parses `arp -an` (with `/proc/net/arp` fallback on Linux for speed), and writes `device_ip.json`.
+
+> Devices with empty MAC in `devices.json` are skipped by `ip.py` — they are simulation-only devices.
+
+---
+
+## 📝 Log Files
+
+### `connect.log`
+
+Records device connection lifecycle events.
+
+```
+2026-04-27 08:30:00 CONNECT_FIRST  station=10001  ip=192.168.20.37  date=2026-04-27 08:30:00
+2026-04-27 22:15:41 DISCONNECT     station=10001  last_seen=2026-04-27 22:15:36  detected_at=2026-04-27 22:15:41
+2026-04-28 08:45:03 CONNECT_LAST   station=10001  ip=192.168.20.37  offline_sec=37582  date=2026-04-28 08:45:03
+```
+
+| Event | When |
+|---|---|
+| `CONNECT_FIRST` | Device posts to `/station/status` for the first time ever |
+| `DISCONNECT` | Device not seen for > `STALE_THRESHOLD` seconds |
+| `CONNECT_LAST` | Device reconnects after being offline |
+
+### `operation.log`
+
+Records hold and alarm events.
+
+```
+2026-04-27 09:00:10 HOLD_START  station=10005  taskID=TASK-042  robotID=SMR-01  prev_status=NORMAL  initial_status=BUSY
+2026-04-27 09:02:35 HOLD_END    station=10005  taskID=TASK-042  robotID=SMR-01  prev_status=BUSY
+2026-04-27 09:05:00 HOLD_RESTORED  station=10003  taskID=TASK-011  robotID=SMR-02
+2026-04-27 09:10:00 RECONNECT_RECOVERED  station=10008  taskID=TASK-099  robotID=SMR-01  offline_sec=47
+```
+
+### Log retention
+
+All log files older than **7 days** are deleted on server and client startup. Configurable via `LOG_RETENTION_DAYS` environment variable.
 
 ---
 
 ## ❌ Error Codes
 
-All error responses use this envelope:
-
+All errors use this envelope:
 ```json
 { "ret_code": 4011, "error": "Field 'id' must be an integer" }
 ```
 
-### Authentication & Transport
+### Auth & Transport
 
-| ret\_code | HTTP | Name | Cause |
-|---|---|---|---|
-| `4001` | `401` | `UNAUTHORIZED` | Wrong or missing `X-API-Key` header |
-| `4002` | `429` | `RATE_LIMITED` | Device exceeded 5 requests/second |
-| `4003` | `405` | `METHOD_NOT_ALLOWED` | Wrong HTTP verb |
-| `4004` | `404` | `ENDPOINT_NOT_FOUND` | URL path does not exist |
+| ret_code | HTTP | Cause |
+|---|---|---|
+| `4001` | `401` | Wrong or missing `X-API-Key` |
+| `4002` | `429` | Rate limit exceeded (5 req/s per device) |
+| `4003` | `405` | Wrong HTTP method |
+| `4004` | `404` | Unknown endpoint |
 
 ### Payload Validation
 
-| ret\_code | HTTP | Name | Cause |
-|---|---|---|---|
-| `4010` | `400` | `EMPTY_BODY` | Request body missing or not valid JSON |
-| `4011` | `400` | `INVALID_ID` | `id` is missing or not an integer |
-| `4012` | `400` | `INVALID_STATUS` | Status not in `NORMAL/FULL/BUSY/ALARM` |
-| `4013` | `400` | `INVALID_HOLD` | `hold` not boolean, or `taskID`/`robotID` wrong type |
-| `4014` | `400` | `INVALID_ALARM` | `alarm` field not boolean |
-| `4015` | `400` | `INVALID_HEARTBEAT_ID` | `id` missing or not integer in heartbeat payload |
+| ret_code | HTTP | Cause |
+|---|---|---|
+| `4010` | `400` | Empty body or invalid JSON |
+| `4011` | `400` | `id` missing or not integer |
+| `4012` | `400` | `status` not in valid set |
+| `4013` | `400` | `hold` not bool, or `taskID`/`robotID` wrong type |
+| `4014` | `400` | `alarm` not bool |
+| `4015` | `400` | Heartbeat `id` missing or not integer |
 
 ### Device State
 
-| ret\_code | HTTP | Name | Cause |
-|---|---|---|---|
-| `4020` | `404` | `DEVICE_NOT_FOUND` | Device not registered — must POST `/station/status` first |
-| `4021` | `404` | `DEVICE_NOT_IN_HB` | No heartbeat received yet for that device |
-| `4030` | `409/403` | `ALREADY_HELD` | `409` = held by another robot · `403` = wrong robot releasing |
-
-> **Holding a FULL station is not an error.** It returns `HTTP 200` with `status: "FULL"`. The robot waits and polls.
+| ret_code | HTTP | Cause |
+|---|---|---|
+| `4020` | `404` | Device not registered |
+| `4021` | `404` | No heartbeat received for device |
+| `4022` | `409` | Device is OFFLINE — hold/alarm rejected |
+| `4030` | `409/403` | `409` = held by another robot · `403` = wrong robot releasing |
+| `4031` | — | Reserved (CANNOT_HOLD_FULL — currently unused) |
 
 ### Scan
 
-| ret\_code | HTTP | Name | Cause |
-|---|---|---|---|
-| `4040` | `409` | `SCAN_IN_PROGRESS` | Another scan is already running |
-| `4041` | `404` | `SCAN_NO_RESULT` | `GET /scan/result` called before any scan has run |
-| `4042` | `400` | `INVALID_SUBNET` | Subnet string is not valid CIDR notation |
+| ret_code | HTTP | Cause |
+|---|---|---|
+| `4040` | `409` | Scan already running |
+| `4041` | `404` | No scan result yet |
+| `4042` | `400` | Invalid subnet string |
 
 ### Server
 
-| ret\_code | HTTP | Cause |
+| ret_code | HTTP | Cause |
 |---|---|---|
-| `5000` | `500` | Unhandled server exception — check server logs |
+| `5000` | `500` | Unhandled server exception |
 
 ---
 
 ## ⚙️ Configuration Reference
 
-### `server.py`
+### `server_sim.py`
 
 | Variable | Default | Description |
 |---|---|---|
 | `API_KEY` | `nextroboticslab2024` | Shared API key |
-| `STALE_THRESHOLD` | `10` | Seconds without a POST before device is marked disconnected |
+| `STALE_THRESHOLD` | `5` | Seconds without POST before device is OFFLINE |
 | `RATE_LIMIT` | `5` | Max requests/second per device |
 | `DEVICES_FILE` | `devices.json` | Input MAC map |
 | `DEVICE_IP_FILE` | `device_ip.json` | Output IP map |
-| `DEFAULT_SUBNET` | `192.168.20.0/24` | Subnet for auto and manual scans |
+| `DEFAULT_SUBNET` | `192.168.20.0/24` | Subnet for auto/manual scans |
 | `NMAP_TIMEOUT` | `60` | nmap per-host timeout (seconds) |
 | `PERIODIC_SCAN_INTERVAL` | `600` | Seconds between periodic scans |
-| `DISCONNECT_SCAN_DELAY` | `30` | Seconds to wait before rescan after disconnect |
-| `STATE_FILE` | `state.json` | Hold/alarm persistence file |
+| `DISCONNECT_SCAN_DELAY` | `30` | Seconds before rescan after disconnect |
+| `STATE_FILE` | `state.json` | Hold/alarm persistence |
+| `STATE_SIM_FILE` | `state_sim.json` | Simulation state persistence |
+| `LOG_RETENTION_DAYS` | `7` | Days before log files are deleted |
 
-### `cilent.py`
+### `client.py`
 
 | Variable | Default | Description |
 |---|---|---|
@@ -723,165 +730,104 @@ All error responses use this envelope:
 | `POLL_INTERVAL` | `1.0` | Seconds between Modbus reads |
 | `HEARTBEAT_INTERVAL` | `1.0` | Seconds between heartbeat POSTs |
 | `WATCHDOG_INTERVAL` | `10.0` | Seconds between watchdog checks |
+| `RECONNECT_INTERVAL` | `10.0` | Fixed retry interval — never gives up |
 | `OFFLINE_BUFFER_SIZE` | `200` | Max queued payloads per device |
-| `MAX_RECONNECT_DELAY` | `120` | Modbus reconnect backoff ceiling (seconds) |
-| `MODBUS_PORT` | `8899` | TCP port on each station device |
+| `MODBUS_PORT` | `8899` | TCP port on each station |
 | `MODBUS_TIMEOUT` | `5.0` | Modbus read/write timeout (seconds) |
-
----
-
-## 📁 File Reference
-
-| File | Purpose |
-|---|---|
-| `devices.json` | **Input** — maps device ID → MAC address |
-| `device_ip.json` | **Auto-managed** — maps device ID → IP |
-| `state.json` | **Auto-managed** — persists hold/alarm across restarts |
-| `operation.log` | Hold start/end/restore events (10 MB × 10 files) |
-| `client.log` | Modbus reads, reconnect events (5 MB × 5 files) |
-
----
-
-## 💡 Coil / LED Mapping
-
-| Coil | Color | Active When |
-|---|---|---|
-| `0` | 🟢 Green | `status = NORMAL` |
-| `1` | 🟡 Yellow | `status = BUSY` |
-| `2` | 🔴 Red | `status = FULL` |
-| `3` | 🔔 Buzzer | `status = ALARM` |
-
-Only one coil is active at a time.
-
-> When a robot holds a FULL station while waiting, the LED stays 🔴 Red until the item is removed, then switches automatically to 🟡 Yellow (`BUSY`).
+| `LOG_RETENTION_DAYS` | `7` | Days before log files are deleted |
 
 ---
 
 ## 🔁 Data Flow Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Station Device (x16)                    │
-│              Modbus-TCP  192.168.20.x:8899                  │
-└──────────────────────────┬──────────────────────────────────┘
-                           │  read_discrete_inputs(0, 8)
-                           │  write_multiple_coils(0, [G,Y,R,A])
-                           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                        cilent.py                            │
-│  • One thread per device                                    │
-│  • Watchdog thread (restarts dead threads)                  │
-│  • Heartbeat thread (POST /heartbeat every 1s)              │
-│  • IP-watch thread  (polls /device_ip/version every 30s)    │
-│  • Offline buffer (200 payloads per device)                 │
-└──────────┬──────────────────────────────────────────────────┘
-           │  POST /station/status  (every 1s)
-           │  POST /heartbeat       (every 1s)
-           ▼
-┌─────────────────────────────────────────────────────────────┐
-│                        server.py                            │
-│                                                             │
-│  Status logic:                                              │
-│    hold=true  + sensor=1  →  FULL   (robot waits)           │
-│    hold=true  + sensor=0  →  BUSY   (robot proceeds)        │
-│    hold=false + sensor=1  →  FULL                           │
-│    hold=false + alarm     →  ALARM                          │
-│    hold=false + sensor=0  →  NORMAL                         │
-│                                                             │
-│  State saved to state.json on every hold/alarm change       │
-│                                                             │
-│  Auto-scan threads:                                         │
-│    • Startup scan                                           │
-│    • Periodic scan (every 10 min)                           │
-│    • Disconnect-triggered scan (30s debounce)               │
-└──────────┬──────────────────────────────────────────────────┘
-           │
-    ┌──────┴──────────────────────┐
-    │                             │
-    ▼                             ▼
-Dashboard / Node-RED          Robot / AMR
-GET /station/status/all       POST /station/standby
-GET /health                   POST /station/alarm
-GET /heartbeat/all            GET /station/status/<id>
+devices.json  ──→  ip.py  ──→  device_ip.json
+(id + MAC)    nmap + ARP       (id + IP)
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────┐
+│                   server_sim.py                      │
+│              Flask REST API :5000                    │
+│                                                      │
+│  Status logic:                                       │
+│    sim_active + sim_input=1  →  FULL                 │
+│    sim_active + sim_input=0  →  NORMAL/BUSY          │
+│    hold=true  + sensor=1     →  FULL  (robot waits)  │
+│    hold=true  + sensor=0     →  BUSY  (robot goes)   │
+│    sensor=1   (no hold)      →  FULL                 │
+│    alarm=true (no hold)      →  ALARM                │
+│    no heartbeat > 5s         →  OFFLINE              │
+│    else                      →  NORMAL               │
+│                                                      │
+│  Persistence:                                        │
+│    state.json      ← hold/alarm on every change      │
+│    state_sim.json  ← sim state on every change       │
+│                                                      │
+│  Auto-scan: startup / 10min / on-disconnect          │
+└──────────────────┬──────────────────────────────────┘
+                   │  HTTP POST every 1s
+                   │  POST /heartbeat every 1s
+                   ▼
+┌─────────────────────────────────────────────────────┐
+│                    client.py                         │
+│  • One thread per device (from device_ip.json)       │
+│  • Retry every 10s forever — no backoff ceiling      │
+│  • Watchdog thread restarts dead threads             │
+│  • Heartbeat thread (one POST per device per 1s)     │
+│  • Offline buffer (200 payloads per device)          │
+│  • connect.log: FIRST / LAST connection events       │
+└──────────────────┬──────────────────────────────────┘
+                   │  Modbus-TCP port 8899
+                   ▼
+┌─────────────────────────────────────────────────────┐
+│           PLC / Modbus Device (per station)          │
+│   Read:  Discrete Inputs 0–1 (sensor)                │
+│   Write: Coils 0–3 (signal tower lights + buzzer)    │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 🚀 Complete Request Examples
-
-### Check all stations
+## 🚀 Quick API Reference
 
 ```bash
-curl -H "X-API-Key: nextroboticslab2024" \
-     http://192.168.10.211:5000/station/status/all
-```
+BASE="http://192.168.10.211:5000"
+KEY="nextroboticslab2024"
+H='-H "X-API-Key: '$KEY'" -H "Content-Type: application/json"'
 
-### Hold a station (clear — immediate BUSY)
+# Status
+curl -H "X-API-Key: $KEY" $BASE/station/status/all
+curl -H "X-API-Key: $KEY" $BASE/station/status/10001
 
-```bash
-curl -X POST \
-     -H "X-API-Key: nextroboticslab2024" \
-     -H "Content-Type: application/json" \
-     -d '{"id": 10005, "hold": true, "robotID": "SMR-01", "taskID": "TASK-042"}' \
-     http://192.168.10.211:5000/station/standby
-# → { "status": "BUSY", "hold": true, ... }
-```
+# Hold / Release
+curl -X POST $H $BASE/station/standby \
+  -d '{"id":10005,"hold":true,"robotID":"SMR-01","taskID":"TASK-042"}'
+curl -X POST $H $BASE/station/standby \
+  -d '{"id":10005,"hold":false,"robotID":"SMR-01"}'
 
-### Hold a station (FULL — robot waits)
+# Alarm
+curl -X POST $H $BASE/station/alarm -d '{"id":10005,"alarm":true}'
 
-```bash
-curl -X POST \
-     -H "X-API-Key: nextroboticslab2024" \
-     -H "Content-Type: application/json" \
-     -d '{"id": 10005, "hold": true, "robotID": "SMR-01", "taskID": "TASK-042"}' \
-     http://192.168.10.211:5000/station/standby
-# → { "status": "FULL", "hold": true, "taskID": "TASK-042", "robotID": "SMR-01" }
-# Robot polls GET /station/status/10005 until status == "BUSY"
-```
+# Simulation
+curl -X POST $H $BASE/simulation/mode  -d '{"id":30022,"active":true}'
+curl -X POST $H $BASE/simulation/input -d '{"id":30022,"input":1}'
+curl -X POST $H $BASE/simulation/mode  -d '{"id":30022,"active":false}'
 
-### Release hold
+# Health (no auth)
+curl $BASE/health
 
-```bash
-curl -X POST \
-     -H "X-API-Key: nextroboticslab2024" \
-     -H "Content-Type: application/json" \
-     -d '{"id": 10005, "hold": false, "robotID": "SMR-01"}' \
-     http://192.168.10.211:5000/station/standby
-```
-
-### Turn alarm on
-
-```bash
-curl -X POST \
-     -H "X-API-Key: nextroboticslab2024" \
-     -H "Content-Type: application/json" \
-     -d '{"id": 10005, "alarm": true}' \
-     http://192.168.10.211:5000/station/alarm
-```
-
-### Trigger manual IP scan
-
-```bash
-curl -X POST \
-     -H "X-API-Key: nextroboticslab2024" \
-     -H "Content-Type: application/json" \
-     -d '{"subnet": "192.168.20.0/24", "timeout": 60}' \
-     http://192.168.10.211:5000/scan
-```
-
-### Check health (no auth needed)
-
-```bash
-curl http://192.168.10.211:5000/health
+# Manual IP scan
+curl -X POST $H $BASE/scan -d '{"subnet":"192.168.20.0/24","timeout":60}'
 ```
 
 ---
 
 ## 📝 License
 
-Taweeporn Maneesin — Robotics software engineer  
+Taweeporn Maneesin — Robotics Software Engineer
 Next Robotics Lab — Internal Use
 
 ---
 
-*Last updated: 2026-04-20*
+*Last updated: 2026-04-28*
+Done
