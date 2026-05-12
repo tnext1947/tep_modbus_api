@@ -18,17 +18,33 @@ from pyModbusTCP.client import ModbusClient
 CONFIG_FILE  = "device_ip.json"
 API_URL      = "http://127.0.0.1:5000/station/status"
 API_KEY      = os.environ.get("API_KEY", "nextroboticslab2024")
-POLL_INTERVAL       = 1.0    # seconds between Modbus reads
-HEARTBEAT_INTERVAL  = 1.0    # seconds between heartbeat POSTs
-WATCHDOG_INTERVAL   = 10.0   # seconds between thread health checks
-OFFLINE_BUFFER_SIZE = 200    # max queued payloads per device
-MAX_RECONNECT_DELAY = 120     # seconds (exponential backoff ceiling)
-MODBUS_PORT         = 8899
-MODBUS_TIMEOUT      = 5.0
+POLL_INTERVAL           = 1.0    # seconds between Modbus reads
+HEARTBEAT_INTERVAL      = 1.0    # seconds between heartbeat POSTs
+WATCHDOG_INTERVAL       = 10.0   # seconds between thread health checks
+OFFLINE_BUFFER_SIZE     = 200    # max queued payloads per device
+RECONNECT_INTERVAL      = 10.0   # seconds between reconnect attempts (fixed, no backoff ceiling)
+MODBUS_PORT             = 8899
+MODBUS_TIMEOUT          = 5.0
+LOG_RETENTION_DAYS      = 7      # connect.log and operation.log kept for 7 days
 
 # ─────────────────────────────────────────────
 #  Logger
 # ─────────────────────────────────────────────
+
+import glob
+
+def _purge_old_logs(log_path: str, days: int) -> None:
+    """Delete log files older than `days` days (handles rotated .1/.2/etc files)."""
+    cutoff = time.time() - days * 86400
+    base = log_path
+    for f in glob.glob(base + "*"):
+        try:
+            if os.path.getmtime(f) < cutoff:
+                os.remove(f)
+                print(f"[LOG-PURGE] Deleted old log: {f}")
+        except OSError:
+            pass
+
 
 def setup_logger(name: str, logfile: str) -> logging.Logger:
     logger = logging.getLogger(name)
@@ -43,7 +59,25 @@ def setup_logger(name: str, logfile: str) -> logging.Logger:
     logger.addHandler(sh)
     return logger
 
+
 logger = setup_logger("modbus_client", "client.log")
+
+# ── connect.log — first connect and last connect per device ──────────────
+# Format: "YYYY-MM-DD HH:MM:SS  CONNECT_FIRST / CONNECT_LAST  station=ID  ip=IP"
+_connect_logger = logging.getLogger("connect")
+_connect_logger.setLevel(logging.INFO)
+_connect_logger.propagate = False
+_connect_fh = RotatingFileHandler("connect.log", maxBytes=5 * 1024 * 1024, backupCount=14)
+_connect_fh.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_connect_logger.addHandler(_connect_fh)
+
+# Per-device first-connect flag so we log CONNECT_FIRST only once per session
+_first_connect_done: dict = {}
+_connect_lock = threading.Lock()
+
+# Purge logs older than 7 days on startup
+_purge_old_logs("client.log", LOG_RETENTION_DAYS)
+_purge_old_logs("connect.log", LOG_RETENTION_DAYS)
 
 # ─────────────────────────────────────────────
 #  Load & validate device config
@@ -170,25 +204,49 @@ def post_with_buffer(device_id: int, payload: dict) -> dict | None:
     return last_response
 
 # ─────────────────────────────────────────────
-#  Modbus connect with exponential backoff
+#  Modbus connect — fixed 10s retry, no timeout
 # ─────────────────────────────────────────────
 
 def connect_with_backoff(client: ModbusClient, device_id: int) -> bool:
+    """
+    Retry Modbus connection every RECONNECT_INTERVAL seconds forever.
+    No exponential backoff, no ceiling — keeps retrying every 10s until success or shutdown.
+    Logs CONNECT_FIRST on the very first successful connection per session,
+    and CONNECT_LAST on every subsequent reconnect.
+    """
     _ensure_device_state(device_id)
-    delay = 1.0
     attempt = 0
     while not shutdown_event.is_set():
         if client.open():
-            if attempt > 0:
-                logger.info(f"[{device_id}] Reconnected after {attempt} attempt(s)")
+            ip = client.host
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with _connect_lock:
+                is_first = not _first_connect_done.get(device_id, False)
+                if is_first:
+                    _first_connect_done[device_id] = True
+
+            if is_first:
+                _connect_logger.info(
+                    f"CONNECT_FIRST  station={device_id}  ip={ip}"
+                )
+                logger.info(f"[{device_id}] First connection established — IP: {ip}")
+            else:
                 metrics[device_id]["reconnects"] += 1
+                _connect_logger.info(
+                    f"CONNECT_LAST   station={device_id}  ip={ip}"
+                    f"  attempt={attempt}"
+                )
+                logger.info(
+                    f"[{device_id}] Reconnected after {attempt} attempt(s) — IP: {ip}"
+                )
             return True
+
         attempt += 1
-        jitter = random.uniform(0, delay * 0.25)
-        wait = delay + jitter
-        logger.warning(f"[{device_id}] Connect failed. Retry #{attempt} in {wait:.1f}s")
-        shutdown_event.wait(wait)
-        delay = min(delay * 2, MAX_RECONNECT_DELAY)
+        logger.warning(
+            f"[{device_id}] Connect failed (attempt #{attempt}). "
+            f"Retrying in {RECONNECT_INTERVAL:.0f}s ..."
+        )
+        shutdown_event.wait(RECONNECT_INTERVAL)   # fixed 10s — never gives up
     return False
 
 # ─────────────────────────────────────────────
@@ -219,7 +277,8 @@ def read_and_send(device_id: int, ip: str) -> None:
     DEBOUNCE_TIME = 0.5
 
     if not connect_with_backoff(client, device_id):
-        logger.error(f"[{device_id}] Could not connect during startup. Thread exits.")
+        # Only reaches here if shutdown_event is set
+        logger.info(f"[{device_id}] Shutdown during initial connect. Thread exits.")
         return
 
     # Write green (NORMAL) coil immediately on startup
@@ -229,11 +288,11 @@ def read_and_send(device_id: int, ip: str) -> None:
 
     while not shutdown_event.is_set():
         try:
-            # ── Ensure connection ──────────────────────────────
+            # ── Ensure connection — retry every 10s forever ────
             if not client.is_open:
                 logger.warning(f"[{device_id}] Connection lost. Reconnecting...")
                 if not connect_with_backoff(client, device_id):
-                    break
+                    break   # only exits on shutdown
 
             # ── Read discrete inputs ───────────────────────────
             regs = client.read_discrete_inputs(0, 8)
@@ -263,6 +322,7 @@ def read_and_send(device_id: int, ip: str) -> None:
             }
 
             response = post_with_buffer(device_id, payload)
+            is_sim   = False
 
             if response is not None:
                 my_hold     = response.get("hold_mode",  False)
@@ -270,6 +330,7 @@ def read_and_send(device_id: int, ip: str) -> None:
                 my_task_id  = response.get("taskID",     None)
                 my_robot_id = response.get("robotID",    None)
                 state       = response.get("status",     "NORMAL")
+                is_sim      = response.get("simulated",  False)
                 metrics[device_id]["last_seen"] = payload["timestamp"]
             else:
                 # No response — derive state locally as fallback
@@ -283,7 +344,8 @@ def read_and_send(device_id: int, ip: str) -> None:
                     state = "NORMAL"
 
             hold_info = f"taskID={my_task_id} robotID={my_robot_id}" if my_hold else "—"
-            logger.info(f"[{device_id}] State:{state}  Input:{input_status}  Hold:{my_hold}  {hold_info}  "
+            sim_tag   = "[SIM] " if is_sim else ""
+            logger.info(f"[{device_id}] {sim_tag}State:{state}  Input:{input_status}  Hold:{my_hold}  {hold_info}  "
                         f"Buf:{len(offline_buffers[device_id])}")
 
             # ── Write coils based on state ─────────────────────
@@ -291,6 +353,11 @@ def read_and_send(device_id: int, ip: str) -> None:
             # Coil 1 = Yellow (BUSY)
             # Coil 2 = Red    (FULL)
             # Coil 3 = Alarm  (ALARM)
+            ## SIM
+            # if is_sim:
+            #     # In simulation mode, we skip writing to physical coils
+            #     continue
+
             c1_green     = False
             c2_operation = False
             c3_red       = False

@@ -1,0 +1,17 @@
+# Docker images
+*.tar
+
+# Runtime logs (tracked as empty placeholders — ignore content changes)
+client.log*
+connect.log*
+operation.log*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+env/
+
+# State files (tracked as empty — ignore content changes)
+# state.json
+# state_sim.json

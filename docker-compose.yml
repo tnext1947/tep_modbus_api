@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  lane-server:
+    image: lane-infra:latest
+    container_name: lane-infra
+    ports:
+      - "0.0.0.0:5000:5000"
+    volumes:
+      - ./devices.json:/app/devices.json
+      - ./device_ip.json:/app/device_ip.json
+      - ./state.json:/app/state.json
+      - ./state_sim.json:/app/state_sim.json
+      - ./client.log:/app/client.log
+      - ./connect.log:/app/connect.log
+      - ./operation.log:/app/operation.log
+    environment:
+      - API_KEY=nextroboticslab2024
+      - DEFAULT_SUBNET=192.168.207.0/24
+    restart: always

@@ -11,13 +11,13 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 from flask import Flask, request, jsonify
-
+from flask_cors import CORS
 # ─────────────────────────────────────────────
 #  Config
 # ─────────────────────────────────────────────
 
 API_KEY             = os.environ.get("API_KEY", "nextroboticslab2024")
-STALE_THRESHOLD_SEC = int(os.environ.get("STALE_THRESHOLD", "10"))
+STALE_THRESHOLD_SEC = int(os.environ.get("STALE_THRESHOLD", "5"))
 RATE_LIMIT_PER_SEC  = int(os.environ.get("RATE_LIMIT", "5"))
 
 # Scan config
@@ -32,6 +32,7 @@ DISCONNECT_SCAN_DELAY  = int(os.environ.get("DISCONNECT_SCAN_DELAY",  "30"))   #
 
 # State persistence — survives server restart
 STATE_FILE     = os.environ.get("STATE_FILE", "state.json")
+STATE_SIM_FILE = os.environ.get("STATE_SIM_FILE", "state_sim.json")
 
 # ─────────────────────────────────────────────
 #  Logger
@@ -79,6 +80,32 @@ def _save_state() -> None:
             json.dump(snapshot, f, indent=2)
     except OSError as e:
         logger.error(f"[STATE] Failed to save state: {e}")
+
+
+def _save_sim_state() -> None:
+    """Persist simulation state to STATE_SIM_FILE."""
+    with sim_lock:
+        snapshot = {str(k): v for k, v in sim_db.items()}
+    try:
+        with open(STATE_SIM_FILE, "w") as f:
+            json.dump(snapshot, f, indent=2)
+    except OSError as e:
+        logger.error(f"[SIM-STATE] Failed to save: {e}")
+
+
+def _load_sim_state() -> None:
+    """Load persisted simulation state."""
+    if not os.path.exists(STATE_SIM_FILE):
+        return
+    try:
+        with open(STATE_SIM_FILE) as f:
+            snapshot = json.load(f)
+        with sim_lock:
+            for k, v in snapshot.items():
+                sim_db[int(k)] = v
+        logger.info(f"[SIM-STATE] Loaded {len(snapshot)} device(s)")
+    except (OSError, json.JSONDecodeError, ValueError) as e:
+        logger.warning(f"[SIM-STATE] Could not load: {e}")
 
 
 def _load_state() -> None:
@@ -130,17 +157,23 @@ def _load_state() -> None:
 # ─────────────────────────────────────────────
 
 app = Flask(__name__)
+CORS(app)
 
 # Structure per device:
 # { "hold": bool, "alarm": bool, "status": str, "timestamp": str,
 #   "taskID": str|None, "robotID": str|None }
 devices_db: dict[int, dict] = {}
-db_lock = threading.Lock()
+db_lock = threading.RLock()
 
 # Per-device heartbeat store
 # Structure: { device_id: { ...metrics..., "received_at": str } }
 heartbeat_db: dict[int, dict] = {}
-hb_lock = threading.Lock()
+hb_lock = threading.RLock()
+
+# Per-device simulation store
+# { device_id: { "active": bool, "input": int } }
+sim_db: dict[int, dict] = {}
+sim_lock = threading.RLock()
 
 # Per-device rate limiting
 _rate_buckets: dict[int, list] = {}
@@ -216,6 +249,7 @@ RC_INVALID_HEARTBEAT_ID  = 4015  # heartbeat id missing or not integer
 # Device state
 RC_DEVICE_NOT_FOUND      = 4020  # device_id not registered
 RC_DEVICE_NOT_IN_HB      = 4021  # no heartbeat recorded for device
+RC_DEVICE_OFFLINE        = 4022  # device is OFFLINE (heartbeat last_seen > STALE_THRESHOLD_SEC)
 RC_ALREADY_HELD          = 4030  # station already held by another robot
 RC_CANNOT_HOLD_FULL      = 4031  # station physically FULL, cannot hold
 # Scan
@@ -232,6 +266,30 @@ def _err(ret_code: int, message: str, http_status: int, **extra):
     body = {"ret_code": ret_code, "error": message}
     body.update(extra)
     return _j(body), http_status
+
+
+def _is_device_offline(device_id: int) -> bool:
+    """
+    Return True if the device has no heartbeat, or its last_seen is older
+    than STALE_THRESHOLD_SEC seconds.
+    If simulation is active, the device is NEVER considered offline for API commands.
+    """
+    with sim_lock:
+        if sim_db.get(device_id, {}).get("active"):
+            return False
+
+    with hb_lock:
+        hb = heartbeat_db.get(device_id)
+    if hb is None:
+        return True   # never received a heartbeat — treat as offline
+    last_seen = hb.get("last_seen")
+    if not last_seen:
+        return True
+    try:
+        last_dt = datetime.strptime(last_seen, "%Y-%m-%d %H:%M:%S")
+        return (datetime.now() - last_dt).total_seconds() > STALE_THRESHOLD_SEC
+    except ValueError:
+        return True
 
 def validate_status_payload(data: dict) -> str | None:
     if not data:
@@ -265,6 +323,105 @@ def validate_alarm_payload(data: dict) -> str | None:
         return "Field 'alarm' must be true or false"
     return None
 
+def _derive_device_status(device_id: int) -> str:
+    """
+    Centralized status logic.
+    Priority: SIM Mode > Real Physical State.
+    If Simulated: Returns "SIM-NORMAL", "SIM-FULL", "SIM-BUSY", or "SIM-ALARM".
+    If Not Simulated: Returns "NORMAL", "FULL", "BUSY", "ALARM", or "OFFLINE".
+    """
+    with sim_lock:
+        s = sim_db.get(device_id, {"active": False, "input": 0})
+        is_sim = s["active"]
+        virtual_in = s["input"]
+
+    with db_lock:
+        d = devices_db.get(device_id)
+        if not d:
+            return "OFFLINE"
+
+        hold  = d.get("hold",  False)
+        alarm = d.get("alarm", False)
+
+        # Use virtual input if sim is active, else use physical input
+        effective_in = virtual_in if is_sim else d.get("input", 0)
+
+        # ── Core Logic ──
+        if hold and effective_in == 1:
+            base_status = "FULL"
+        elif hold and effective_in == 0:
+            base_status = "BUSY"
+        elif effective_in == 1:
+            base_status = "FULL"
+        elif alarm:
+            base_status = "ALARM"
+        else:
+            base_status = "NORMAL"
+
+
+        ## SIM-STATE TURN ON-OFF
+        # if is_sim:
+        #     return f"SIM-{base_status}"
+
+        # If not sim, check if actually offline
+        if _is_device_offline(device_id):
+            return "OFFLINE"
+
+        return base_status
+
+
+# ─────────────────────────────────────────────
+#  Routes — Simulation (Control from Dashboard)
+# ─────────────────────────────────────────────
+
+@app.route("/simulation/mode", methods=["POST"])
+@require_api_key
+def set_sim_mode():
+    """Toggle simulation mode for a specific device."""
+    data = request.get_json(silent=True) or {}
+    device_id = data.get("id")
+    active    = data.get("active", False)
+    if not isinstance(device_id, int):
+        return _err(RC_INVALID_ID, "id must be integer", 400)
+
+    with sim_lock:
+        s = sim_db.setdefault(device_id, {"active": False, "input": 0})
+        s["active"] = active
+        _save_sim_state()
+
+    # Force immediate status update
+    with db_lock:
+        if device_id in devices_db:
+            devices_db[device_id]["status"] = _derive_device_status(device_id)
+
+    logger.info(f"[{device_id}] Simulation mode set to {active}")
+    return jsonify({"id": device_id, "sim_active": active}), 200
+
+
+@app.route("/simulation/input", methods=["POST"])
+@require_api_key
+def set_sim_input():
+    """Set virtual input for a specific device."""
+    data = request.get_json(silent=True) or {}
+    device_id = data.get("id")
+    val       = data.get("input", 0)
+    if not isinstance(device_id, int):
+        return _err(RC_INVALID_ID, "id must be integer", 400)
+
+    with sim_lock:
+        s = sim_db.setdefault(device_id, {"active": False, "input": 0})
+        s["input"] = 1 if val else 0
+        _save_sim_state()
+
+    # Force immediate status update
+    with db_lock:
+        if device_id in devices_db:
+            devices_db[device_id]["status"] = _derive_device_status(device_id)
+
+    logger.info(f"[{device_id}] Simulated input set to {s['input']}")
+    return jsonify({"id": device_id, "sim_input": s["input"]}), 200
+
+
 # ─────────────────────────────────────────────
 #  Routes — status (called by client every second)
 # ─────────────────────────────────────────────
@@ -281,6 +438,14 @@ def update_status():
 
     device_id   = data["id"]
     raw_input   = data["input"]   # 0 or 1 — physical sensor only
+
+    # ── Simulation Logic ─────────────────────────────
+    is_sim = False
+    with sim_lock:
+        s = sim_db.get(device_id)
+        if s and s.get("active"):
+            is_sim = True
+            raw_input = s.get("input", 0)
 
     with db_lock:
         if device_id not in devices_db:
@@ -322,22 +487,12 @@ def update_status():
         devices_db[device_id]["timestamp"] = data.get("timestamp")
         devices_db[device_id]["input"]     = raw_input
 
-        # ── Server derives status — priority: BUSY > FULL > ALARM > NORMAL ──
-        hold    = devices_db[device_id].get("hold",  False)
-        alarm   = devices_db[device_id].get("alarm", False)
+        # ── Server derives status ──
+        status = _derive_device_status(device_id)
+        devices_db[device_id]["status"] = status
 
-        if hold:
-            status = "BUSY"       # operation mode — overrides sensor and alarm
-        elif raw_input == 1:
-            status = "FULL"       # physical sensor
-        elif alarm:
-            status = "ALARM"      # buzzer
-        else:
-            status = "NORMAL"
-
-        devices_db[device_id]["status"]  = status
-        response_hold    = hold
-        response_alarm   = alarm
+        response_hold    = devices_db[device_id].get("hold",  False)
+        response_alarm   = devices_db[device_id].get("alarm", False)
         response_taskID  = devices_db[device_id].get("taskID",  None)
         response_robotID = devices_db[device_id].get("robotID", None)
 
@@ -348,6 +503,7 @@ def update_status():
         "alarm_mode": response_alarm,
         "taskID":     response_taskID,
         "robotID":    response_robotID,
+        "simulated":  is_sim,  # Tell client to skip physical Modbus writes
     }), 201
 
 
@@ -356,6 +512,18 @@ def update_status():
 def get_all():
     with db_lock:
         snapshot = {k: dict(v) for k, v in devices_db.items()}
+
+    for device_id, d in snapshot.items():
+        # Always derive status fresh — never trust the cached value
+        d["status"] = _derive_device_status(device_id)
+
+        with sim_lock:
+            s = sim_db.get(device_id, {"active": False, "input": 0})
+            d["sim_active"] = s["active"]
+            d["sim_input"]  = s["input"]
+            if s["active"]:
+                d["input"] = s["input"]
+
     return jsonify(snapshot), 200
 
 
@@ -365,7 +533,18 @@ def get_one(device_id):
     with db_lock:
         device = devices_db.get(device_id)
     if device:
-        return jsonify(dict(device)), 200
+        result = dict(device)
+        # Always derive status fresh — never trust the cached value
+        result["status"] = _derive_device_status(device_id)
+
+        with sim_lock:
+            s = sim_db.get(device_id, {"active": False, "input": 0})
+            result["sim_active"] = s["active"]
+            result["sim_input"]  = s["input"]
+            if s["active"]:
+                result["input"] = s["input"]
+
+        return jsonify(result), 200
     return _err(RC_DEVICE_NOT_FOUND, "Device not found", 404)
 
 # ─────────────────────────────────────────────
@@ -385,6 +564,16 @@ def set_standby():
     hold      = data["hold"]
     task_id   = data.get("taskID")
     robot_id  = data["robotID"]   # always present now (required in validation)
+
+    # ── OFFLINE guard — reject any hold/release on offline device ──
+    # Check before acquiring db_lock to avoid deadlock with hb_lock.
+    if _is_device_offline(device_id):
+        logger.warning(f"[{device_id}] Hold request rejected — device is OFFLINE")
+        return _err(
+            RC_DEVICE_OFFLINE,
+            f"Device {device_id} is OFFLINE — cannot set hold while device is unreachable",
+            409,
+        )
 
     with db_lock:
         if device_id not in devices_db:
@@ -410,25 +599,18 @@ def set_standby():
         # only blocks the *initial* hold request while sensor is HIGH.
         if hold and not current_hold:
             current_input = devices_db[device_id].get("input", 0)
-            if current_input == 1 or devices_db[device_id].get("status") == "FULL":
-                logger.warning(f"[{device_id}] Hold rejected — station is FULL "
-                               f"(taskID={task_id}, robotID={robot_id})")
-                return _err(RC_CANNOT_HOLD_FULL,
-                            f"Device {device_id} is FULL — clear the station before setting hold",
-                            409,
-                            status=devices_db[device_id].get("status"),
-                            taskID=task_id, robotID=robot_id)
-
-        # ── Activate hold (BUSY overrides everything incl. FULL) ──
-        if hold and not current_hold:
+            # Status: FULL if sensor still HIGH, BUSY if already clear
+            initial_status = "FULL" if current_input == 1 else "BUSY"
             devices_db[device_id]["hold"]    = True
             devices_db[device_id]["taskID"]  = task_id
             devices_db[device_id]["robotID"] = robot_id
-            devices_db[device_id]["status"]  = "BUSY"
-            logger.info(f"[{device_id}] Hold ON  — taskID={task_id} robotID={robot_id}")
+            devices_db[device_id]["status"]  = initial_status
+            logger.info(f"[{device_id}] Hold ON  — taskID={task_id} robotID={robot_id} "
+                        f"initial_status={initial_status}")
             _op_logger.info(
                 f"HOLD_START  station={device_id}  taskID={task_id}"
                 f"  robotID={robot_id}  prev_status={current_status}"
+                f"  initial_status={initial_status}"
             )
             _save_state()
 
@@ -445,13 +627,15 @@ def set_standby():
             devices_db[device_id]["hold"]    = False
             devices_db[device_id]["taskID"]  = None
             devices_db[device_id]["robotID"] = None
-            devices_db[device_id]["status"]  = "NORMAL"
             logger.info(f"[{device_id}] Hold OFF — taskID={current_task} robotID={current_robot} cleared")
             _op_logger.info(
                 f"HOLD_END    station={device_id}  taskID={current_task}"
                 f"  robotID={current_robot}  prev_status={current_status}"
             )
             _save_state()
+
+        # Recalculate status immediately
+        devices_db[device_id]["status"] = _derive_device_status(device_id)
 
         # Read results AFTER branches have mutated the record
         result_hold     = devices_db[device_id].get("hold",    False)
@@ -480,6 +664,15 @@ def set_alarm():
     device_id = data["id"]
     mode      = data["alarm"]
 
+    # ── OFFLINE guard — reject alarm command on offline device ──
+    if _is_device_offline(device_id):
+        logger.warning(f"[{device_id}] Alarm request rejected — device is OFFLINE")
+        return _err(
+            RC_DEVICE_OFFLINE,
+            f"Device {device_id} is OFFLINE — cannot set alarm while device is unreachable",
+            409,
+        )
+
     with db_lock:
         if device_id not in devices_db:
             return _err(RC_DEVICE_NOT_FOUND, "Device not found", 404)
@@ -489,6 +682,7 @@ def set_alarm():
     if prev != mode:
         logger.info(f"[{device_id}] Alarm set to {mode}")
         with db_lock:
+            devices_db[device_id]["status"] = _derive_device_status(device_id)
             _save_state()
 
     return jsonify({"message": f"Device {device_id} alarm={mode}"}), 200
@@ -761,16 +955,11 @@ def _check_disconnects_and_trigger_scan():
 
     with db_lock:
         for device_id, d in devices_db.items():
-            ts = d.get("timestamp")
-            if ts:
-                try:
-                    if datetime.strptime(ts, "%Y-%m-%d %H:%M:%S") < cutoff:
-                        currently_disconnected.add(device_id)
-                except ValueError:
-                    pass
-            elif d.get("timestamp") is None and d.get("input") is None:
-                # Device registered but never posted — not yet "disconnected"
-                pass
+            # Update status using centralized logic (handles OFFLINE vs SIM)
+            d["status"] = _derive_device_status(device_id)
+
+            if d["status"] == "OFFLINE":
+                currently_disconnected.add(device_id)
 
     newly_disconnected = currently_disconnected - _prev_disconnected
     _prev_disconnected = currently_disconnected
@@ -935,33 +1124,11 @@ def internal_error(e):
 
 if __name__ == "__main__":
     _load_state()
+    _load_sim_state()
 
-    # ── Condition 1: Startup scan (background, non-blocking) ──
-    threading.Thread(
-        target=_background_scan,
-        args=("startup",),
-        daemon=True,
-        name="scan-startup",
-    ).start()
+    # Auto-scan disabled — static IPs are used from device_ip.json.
+    # Use POST /scan to trigger a manual rescan if needed.
 
-    # ── Condition 3: Disconnect monitor ───────────────────────
-    threading.Thread(
-        target=_disconnect_monitor_loop,
-        daemon=True,
-        name="disconnect-monitor",
-    ).start()
-
-    # ── Condition 2 (periodic): Every 10 minutes ──────────────
-    threading.Thread(
-        target=_periodic_scan_loop,
-        daemon=True,
-        name="scan-periodic",
-    ).start()
-
-    logger.info(
-        f"[AUTO-SCAN] Startup scan running | "
-        f"Periodic every {PERIODIC_SCAN_INTERVAL}s | "
-        f"Disconnect rescan after {DISCONNECT_SCAN_DELAY}s delay"
-    )
+    logger.info("[SCAN] Auto-scan disabled — using static IPs from device_ip.json")
     logger.info("Starting server on http://0.0.0.0:5000")
     app.run(host="0.0.0.0", port=5000, debug=False)
